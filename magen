@@ -20,6 +20,14 @@
 # Usage: magen [OPTIONS] [COMMAND [ARGS...]]
 #        magen --help | --version | --self-test
 #
+# Already inside a sandbox (MAGEN_ACTIVE=1): on Linux, BASH_ENV loads the
+# session cmd-logger before this script body runs, installing a DEBUG trap
+# that would log every subsequent line into the outer session log. Clear it
+# before any other commands.
+if [[ "${MAGEN_ACTIVE:-}" == "1" ]]; then
+    trap - DEBUG 2>/dev/null || true
+fi
+
 set -euo pipefail
 
 PROJECT_DIR="$(pwd -P)"
@@ -164,6 +172,26 @@ fi
 
 _ORIGINAL_CMD="${COMMAND_ARGS[*]}"
 
+# Nested sandbox: bwrap cannot nest. Pass through immediately after CLI parse
+# (before allowlists, session log, proxies, validation) so the outer session
+# log is not polluted with hub setup noise. Chromium still needs --no-sandbox.
+if [[ "${MAGEN_ACTIVE:-}" == "1" ]]; then
+    # shellcheck source=lib/chromium.sh
+    source "$SCRIPT_REAL_DIR/lib/chromium.sh"
+    _snap_app=0
+    if [[ "$OS" == "Linux" ]]; then
+        _snap_resolved="$(resolve_snap_binary "${COMMAND_ARGS[0]}")" && {
+            _snap_app=1
+            COMMAND_ARGS[0]="$_snap_resolved"
+        }
+    fi
+    if is_chromium_based "${COMMAND_ARGS[0]}"; then
+        COMMAND_ARGS+=("--no-sandbox")
+        ((_snap_app)) && COMMAND_ARGS+=("--disable-gpu")
+    fi
+    exec "${COMMAND_ARGS[@]}"
+fi
+
 # Lockdown ignores extra host mounts for a minimal attack surface.
 if $LOCKDOWN; then
     EXTRA_RO_MAPS=()
@@ -186,15 +214,6 @@ if [[ "$OS" == "Linux" ]]; then
         _snap_app=1
         COMMAND_ARGS[0]="$_snap_resolved"
     }
-fi
-
-# Nested sandbox: bwrap cannot nest; re-exec with flags so Chromium survives PID namespace teardown.
-if [[ "${MAGEN_ACTIVE:-}" == "1" ]]; then
-    if is_chromium_based "${COMMAND_ARGS[0]}"; then
-        COMMAND_ARGS+=("--no-sandbox")
-        ((_snap_app)) && COMMAND_ARGS+=("--disable-gpu")
-    fi
-    exec "${COMMAND_ARGS[@]}"
 fi
 
 # shellcheck source=lib/config.sh

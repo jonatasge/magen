@@ -362,7 +362,7 @@ The sandbox creates isolated namespaces:
 
 ### 6.11. Nested sandbox detection
 
-If `MAGEN_ACTIVE=1` is already set (indicating the process is already inside a sandbox), the script skips re-sandboxing and adds `--no-sandbox` to Chromium-based commands to prevent Chrome's internal sandbox from conflicting with the outer namespace.
+If `MAGEN_ACTIVE=1` is already set (indicating the process is already inside a sandbox), the hub clears any inherited session `DEBUG` trap immediately (Linux `BASH_ENV` would otherwise log every hub line into the outer session log), parses the CLI, then pass-through-execs the command without re-sandboxing. Chromium-based commands still get `--no-sandbox` so Chrome's internal sandbox does not conflict with the outer namespace.
 
 ---
 
@@ -700,10 +700,10 @@ magen --self-test --lockdown-only
 ### Startup flow
 
 ```text
-1. Parse CLI arguments (--lockdown, --map, --dry-run, --verbose, etc.)
-2. Source lib/chromium.sh (Chromium binary resolution)
-3. Detect Snap apps (resolve snap-confine → real binary)
-4. Check for nested sandbox (MAGEN_ACTIVE=1 → skip re-sandboxing)
+1. If MAGEN_ACTIVE=1: clear inherited DEBUG trap (avoids session-log noise)
+2. Parse CLI arguments (--lockdown, --map, --dry-run, --verbose, etc.)
+3. If MAGEN_ACTIVE=1: Chromium/Snap flags if needed, then exec (no re-sandbox)
+4. Source lib/chromium.sh (Chromium binary resolution) + Snap resolve
 5. Source lib/config.sh (access control lists, helpers)
 6. Source lib/proxies.sh (proxy lifecycle functions)
 7. Start ssh-agent if needed
