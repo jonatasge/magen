@@ -1,0 +1,446 @@
+#!/bin/bash
+#
+# magen — OS-level sandbox CLI for AI coding agents
+#
+# Isolates a command (or interactive shell) so credentials, browser data,
+# and sensitive files are never exposed — even if the agent is compromised
+# or emits destructive commands.
+#
+# Hub entrypoint: parses CLI, loads shared libs, then sources the platform
+# backend (lib/linux.sh or lib/macos.sh) and runs magen_linux / magen_macos.
+#
+# Platforms:
+#   Linux  — lib/linux.sh  (bubblewrap + optional Landlock/cgroups)
+#   macOS  — lib/macos.sh  (sandbox-exec / Seatbelt)
+#   Windows — use WSL2; native Windows is not supported
+#
+# Security model: $HOME is ephemeral (tmpfs on Linux, deny-default on macOS).
+# Only allowlisted dotdirs are remounted; secrets are stripped or proxied.
+#
+# Usage: magen [OPTIONS] [COMMAND [ARGS...]]
+#        magen --help | --version | --self-test
+#
+set -euo pipefail
+
+PROJECT_DIR="$(pwd -P)"
+OS="$(uname -s)"
+
+_self="$0"
+while [ -L "$_self" ]; do
+    _dir="$(cd "$(dirname "$_self")" && pwd)"
+    _self="$(readlink "$_self")"
+    [[ "$_self" != /* ]] && _self="$_dir/$_self"
+done
+SCRIPT_REAL_DIR="$(cd "$(dirname "$_self")" && pwd)"
+MAGEN_VERSION="$(cat "$SCRIPT_REAL_DIR/VERSION" 2>/dev/null || echo "unknown")"
+
+# --- Banner / help / CLI parsing ---
+_show_banner() {
+    [[ -t 2 ]] || return 0
+    clear
+    local W G Y R NC
+    W=$'\033[38;2;255;255;255m'
+    NC=$'\033[0m'
+
+    printf '%s\n' \
+        "" \
+        "${W}  █████     █████       ███        ▄█████████▄  █████████████ █████     █████ " \
+        "${W}   █████   █████       █████      ███       ███  ███      ███  █████     ███  " \
+        "${W}   ██████ ██████      ███ ███     ███            ███      ███  ███ ███   ███  " \
+        "${W}   ███ █████ ███     ███   ███    ███   ███████  ███████       ███  ███  ███  " \
+        "${W}   ███  ███  ███    ███████████   ███       ███  ███      ███  ███   ███ ███  " \
+        "${W}   ███       ███   ███       ███  ███       ███  ███      ███  ███     █████  " \
+        "${W}  █████     █████ █████     █████  ▀█████████▀  █████████████ █████     █████ " \
+        "" \
+        "${R}  MAGEN v${MAGEN_VERSION}${NC}${NC}" \
+        "" >&2
+}
+
+LOCKDOWN=false
+DRY_RUN=false
+VERBOSE=false
+EXTRA_RO_MAPS=()
+EXTRA_RW_MAPS=()
+
+show_help() {
+    cat <<'HELP'
+magen — OS-level sandbox for AI coding agents
+
+Usage: magen [OPTIONS] [COMMAND [ARGS...]]
+
+Options:
+  --map PATH       Mount PATH as read-only inside the sandbox
+  --rw-map PATH    Mount PATH as read-write inside the sandbox
+  --lockdown       Paranoid mode: project read-only, no network, no GPU,
+                   no display, no dotfiles, clean environment
+  --dry-run        Show what the sandbox would do without executing
+  --verbose, -v    Show detailed mount and configuration info
+  --self-test      Run the validation suite and exit
+  --version        Show version and exit
+  --help           Show this help message
+
+Examples:
+  magen bash
+  magen cursor
+  magen --lockdown bash
+  magen --dry-run --verbose bash
+  magen --map /opt/extra-tools bash
+  magen --rw-map /tmp/shared-cache bash
+
+Requirements:
+  Linux:   sudo apt install bubblewrap uidmap
+  macOS:   none (sandbox-exec ships with macOS)
+  Windows: install WSL2 (wsl --install), then run inside the
+           Linux distro. Native Windows is not supported.
+HELP
+}
+
+while [[ $# -gt 0 ]]; do
+    case "${1:-}" in
+        --help | -h)
+            show_help
+            exit 0
+            ;;
+        --version)
+            echo "magen $MAGEN_VERSION"
+            exit 0
+            ;;
+        --self-test)
+            shift
+            exec "$SCRIPT_REAL_DIR/tests/test.sh" "$@"
+            ;;
+        --lockdown)
+            LOCKDOWN=true
+            shift
+            ;;
+        --dry-run)
+            DRY_RUN=true
+            shift
+            ;;
+        --verbose | -v)
+            VERBOSE=true
+            shift
+            ;;
+        --map | --rw-map)
+            MAP_PATH="${2:-}"
+            [ -z "$MAP_PATH" ] && {
+                echo "Error: $1 requires a path argument." >&2
+                exit 1
+            }
+            if [ -e "$MAP_PATH" ]; then
+                [[ "$1" == "--map" ]] && EXTRA_RO_MAPS+=("$MAP_PATH") || EXTRA_RW_MAPS+=("$MAP_PATH")
+            else
+                echo "Warning: Path $MAP_PATH not found, skipping." >&2
+            fi
+            shift 2
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            echo "Error: Unknown option $1" >&2
+            exit 1
+            ;;
+        *) break ;;
+    esac
+done
+
+_default_shell="${SHELL:-/bin/zsh}"
+
+if [[ $# -eq 0 ]]; then
+    if [[ "$OS" == "Darwin" ]] && [[ -x "$_default_shell" ]]; then
+        if [[ "$_default_shell" == *"zsh"* ]]; then
+            COMMAND_ARGS=("$_default_shell" "+m")
+        else
+            COMMAND_ARGS=("$_default_shell")
+        fi
+    else
+        COMMAND_ARGS=("bash")
+    fi
+else
+    COMMAND_ARGS=("$@")
+fi
+
+_ORIGINAL_CMD="${COMMAND_ARGS[*]}"
+
+# Lockdown ignores extra host mounts for a minimal attack surface.
+if $LOCKDOWN; then
+    EXTRA_RO_MAPS=()
+    EXTRA_RW_MAPS=()
+fi
+
+# Verbose-only progress logger (no-op unless --verbose).
+log() {
+    $VERBOSE && echo "  $*" >&2
+    return 0
+}
+
+# --- Shared libraries ---
+# shellcheck source=lib/chromium.sh
+source "$SCRIPT_REAL_DIR/lib/chromium.sh"
+
+_snap_app=0
+if [[ "$OS" == "Linux" ]]; then
+    _snap_resolved="$(resolve_snap_binary "${COMMAND_ARGS[0]}")" && {
+        _snap_app=1
+        COMMAND_ARGS[0]="$_snap_resolved"
+    }
+fi
+
+# Nested sandbox: bwrap cannot nest; re-exec with flags so Chromium survives PID namespace teardown.
+if [[ "${MAGEN_ACTIVE:-}" == "1" ]]; then
+    if is_chromium_based "${COMMAND_ARGS[0]}"; then
+        COMMAND_ARGS+=("--no-sandbox")
+        ((_snap_app)) && COMMAND_ARGS+=("--disable-gpu")
+    fi
+    exec "${COMMAND_ARGS[@]}"
+fi
+
+# shellcheck source=lib/config.sh
+source "$SCRIPT_REAL_DIR/lib/config.sh"
+
+# shellcheck source=lib/proxies.sh
+source "$SCRIPT_REAL_DIR/lib/proxies.sh"
+
+# --- Optional ssh-agent for git-over-SSH (socket only) ---
+if ! $LOCKDOWN && ! $DRY_RUN && { [ -z "${SSH_AUTH_SOCK:-}" ] || [ ! -S "${SSH_AUTH_SOCK:-}" ]; }; then
+    echo "ssh-agent not detected. Starting..." >&2
+    SSH_AGENT_OUTPUT=$(
+        if SSH_AGENT_BIN="$(command -v ssh-agent 2>/dev/null)"; then
+            "$SSH_AGENT_BIN" -s
+        else
+            exit 1
+        fi
+    )
+
+    while IFS= read -r _line; do
+        _line="${_line%%;*}"
+        case "$_line" in
+            SSH_AUTH_SOCK=*) SSH_AUTH_SOCK="${_line#SSH_AUTH_SOCK=}" ;;
+            SSH_AGENT_PID=*) SSH_AGENT_PID="${_line#SSH_AGENT_PID=}" ;;
+        esac
+    done <<<"$SSH_AGENT_OUTPUT"
+
+    if [ -n "${SSH_AGENT_PID:-}" ] && [ -n "${SSH_AUTH_SOCK:-}" ] && [ -S "$SSH_AUTH_SOCK" ]; then
+        export SSH_AUTH_SOCK SSH_AGENT_PID
+        SSH_AGENT_STARTED=true
+    else
+        echo "Warning: failed to start ssh-agent securely." >&2
+    fi
+    timeout 5 ssh-add 2>/dev/null || echo "Warning: no default SSH keys added. Run 'ssh-add <key>' if git over SSH is needed." >&2
+fi
+
+# --- Project directory hierarchy ---
+PARENT_DIR="${PROJECT_DIR%/*}"
+[[ -z "$PARENT_DIR" ]] && PARENT_DIR="/"
+
+GIT_WORKTREE_MAIN_GIT=""
+if ! $LOCKDOWN && command -v git &>/dev/null; then
+    {
+        read -r _git_dir
+        read -r _git_common
+    } < <(git -C "$PROJECT_DIR" rev-parse --git-dir --git-common-dir 2>/dev/null) || true
+    if [[ -n "${_git_dir:-}" && -n "${_git_common:-}" && "$_git_dir" != "$_git_common" ]]; then
+        GIT_WORKTREE_MAIN_GIT="$(cd "$PROJECT_DIR" && cd "$_git_common" && pwd -P)" || true
+    fi
+fi
+
+# --- Shared helpers (used by both Linux and macOS paths) ---
+
+# Write session log header. Extra platform-specific lines are passed as arguments.
+_write_session_header() {
+    {
+        printf '=== Sandbox Session ===\n'
+        printf 'Time:    %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        printf 'Mode:    %s\n' "$MODE"
+        printf 'Project: %s\n' "$PROJECT_DIR"
+        printf 'Command: %s\n' "$_ORIGINAL_CMD"
+        printf '\nSecurity:\n'
+        printf '  RW dirs:        %s\n' "${_DOTDIR_RW_LIST[*]}"
+        printf '  RO dirs:        %s\n' "${_DOTDIR_RO_LIST[*]}"
+        printf '  Masked configs: %s\n' "${CONFIG_DENY[*]}"
+        printf '  Masked caches:  %s\n' "${CACHE_DENY[*]}"
+        for _line in "$@"; do printf '%s\n' "$_line"; done
+        if $LOCKDOWN; then
+            printf '  Network:  blocked\n'
+        else
+            printf '  Network:  allowed\n'
+        fi
+        if [ -n "$DOCKER_PROXY_SOCK" ] && [ -S "$DOCKER_PROXY_SOCK" ]; then
+            printf '  Docker:   proxied\n'
+        else
+            printf '  Docker:   not available\n'
+        fi
+        if [ -n "$AZURE_PROXY_PID" ] && [ -S "${AZURE_PROXY_SOCK:-}" ]; then
+            printf '  Azure:    proxied\n'
+        else
+            printf '  Azure:    not available\n'
+        fi
+        printf '=======================\n\n'
+    } >>"$MAGEN_LOG_FILE"
+}
+
+# Write cmd logger script to $1. If $2 is "with-stderr", includes stderr capture logic.
+_write_cmd_logger() {
+    local _file="$1" _stderr="${2:-}"
+    cat >"$_file" <<'LOGGER_COMMON'
+
+# --- Bash Logger ---
+if [[ -n "${MAGEN_SESSION_LOG:-}" && -n "${BASH_VERSION:-}" ]]; then
+    _MAGEN_EXIT_LOGGED=false
+    _log_cmd() {
+        case "$BASH_COMMAND" in _sandbox_*) return ;; esac
+        # When functrace/extdebug is on (e.g. Cursor shell integration), the
+        # trap fires for commands inside functions too. Skip if we are inside
+        # any _sandbox_* function (but not the _sandbox_combined_debug wrapper).
+        local _fn; for _fn in "${FUNCNAME[@]:1}"; do
+            [[ "$_fn" != _sandbox_combined_debug && "$_fn" == _sandbox_* ]] && return
+        done
+        _MAGEN_EXIT_LOGGED=false
+        printf '[%s] %s$ %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$PWD" "$BASH_COMMAND" >> "$MAGEN_SESSION_LOG" 2>/dev/null
+    }
+    _sandbox_other_debug_trap_fn=""
+    _sandbox_combined_debug() {
+        _log_cmd
+        if [[ -n "$_sandbox_other_debug_trap_fn" ]] && declare -F "$_sandbox_other_debug_trap_fn" >/dev/null; then
+            "$_sandbox_other_debug_trap_fn"
+        fi
+    }
+    trap '_log_cmd' DEBUG
+
+    # Re-chain our trap if another script (e.g. Cursor/VSCode shell integration)
+    # replaces it. Runs on each prompt to detect and recover from overrides.
+    _sandbox_ensure_debug() {
+        local _rc=$?
+        local _t
+        _t=$(trap -p DEBUG 2>/dev/null)
+        [[ "$_t" == *_sandbox_* ]] && return "$_rc"
+        if [[ "$_t" =~ trap\ --\ \'(.+)\'\ DEBUG ]]; then
+            local _candidate="${BASH_REMATCH[1]}"
+            if [[ "$_candidate" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] && declare -F "$_candidate" >/dev/null; then
+                _sandbox_other_debug_trap_fn="$_candidate"
+            else
+                _sandbox_other_debug_trap_fn=""
+            fi
+        fi
+        trap '_sandbox_combined_debug' DEBUG
+        return "$_rc"
+    }
+
+    _log_exit() {
+        local _rc=$?
+        if (( _rc != 0 )); then
+            printf '[%s] [exit %d]\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$_rc" >> "$MAGEN_SESSION_LOG" 2>/dev/null
+        fi
+        return "$_rc"
+    }
+    PROMPT_COMMAND="_log_exit;_sandbox_ensure_debug${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
+fi
+
+# --- Zsh Logger ---
+if [[ -n "${MAGEN_SESSION_LOG:-}" && -n "${ZSH_VERSION:-}" ]]; then
+    _sandbox_zsh_logger() {
+        local _cmd="$1"
+        [[ -z "$_cmd" ]] && return
+        # Skip if the same command was just logged in this subshell
+        if [[ "${_LAST_SANDBOX_LOG_CMD:-}" == "$_cmd" && "${_LAST_SANDBOX_LOG_PWD:-}" == "$PWD" ]]; then
+            _LAST_SANDBOX_LOG_CMD=""
+            return
+        fi
+        _LAST_SANDBOX_LOG_CMD="$_cmd"
+        _LAST_SANDBOX_LOG_PWD="$PWD"
+        printf '[%s] %s$ %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$PWD" "$_cmd" >> "$MAGEN_SESSION_LOG" 2>/dev/null
+    }
+
+    # Drop duplicate hook entries before registering
+    if [[ -n "${preexec_functions:-}" ]]; then
+        preexec_functions=(${preexec_functions:#_sandbox_zsh_logger})
+    fi
+    preexec_functions+=(_sandbox_zsh_logger)
+fi
+
+LOGGER_COMMON
+}
+
+
+# --- Session log ---
+_session_log_dir="$HOME/.local/state/magen/sandbox/logs"
+if ! $DRY_RUN; then
+    mkdir -p "$_session_log_dir"
+    find "$_session_log_dir" -name '*.log' -mtime +7 -delete 2>/dev/null || true
+fi
+MAGEN_LOG_FILE="${MAGEN_LOG_FILE:-$_session_log_dir/$(date -u +%Y-%m-%dT%H:%M:%SZ).log}"
+
+# FIFO + external cat: inside sandbox can only append; cannot truncate or rewrite prior log bytes.
+SESSION_LOG_FIFO=""
+_LOG_READER_PID=""
+_LOG_KEEPALIVE_FD=""
+SESSION_LOG_FIFO_DIR=""
+
+# Stop log reader, close keepalive fd, remove FIFO.
+cleanup_log_reader() {
+    if [ -n "$_LOG_KEEPALIVE_FD" ]; then
+        exec 9>&- 2>/dev/null || true
+        _LOG_KEEPALIVE_FD=""
+    fi
+    [ -n "$_LOG_READER_PID" ] && {
+        kill "$_LOG_READER_PID" 2>/dev/null || true
+        wait "$_LOG_READER_PID" 2>/dev/null || true
+    }
+    rm -rf "${SESSION_LOG_FIFO_DIR:-}"
+}
+if ! $DRY_RUN; then
+    mkdir -p /tmp/magen/sandbox
+    SESSION_LOG_FIFO_DIR="$(mktemp -d /tmp/magen/sandbox/log-pipe.XXXXXX)" || exit 1
+    SESSION_LOG_FIFO="$SESSION_LOG_FIFO_DIR/fifo"
+    if mkfifo -m 0600 "$SESSION_LOG_FIFO" 2>/dev/null; then
+        cat <"$SESSION_LOG_FIFO" >>"$MAGEN_LOG_FILE" &
+        _LOG_READER_PID=$!
+        _LOG_KEEPALIVE_FD=9
+        exec 9>"$SESSION_LOG_FIFO"
+    else
+        rm -rf "$SESSION_LOG_FIFO_DIR"
+        SESSION_LOG_FIFO_DIR=""
+        SESSION_LOG_FIFO=""
+    fi
+fi
+
+# Fail fast if host updates broke mounts or policy (silent regressions otherwise).
+if [[ "${MAGEN_SKIP_VALIDATION:-}" != "1" ]] && ! $DRY_RUN; then
+    _test_script="$SCRIPT_REAL_DIR/tests/test.sh"
+    if [ -x "$_test_script" ]; then
+        echo "Validating magen sandbox..." >&2
+        _test_args=()
+        $VERBOSE && _test_args+=("--verbose")
+        if ! MAGEN_LOG_FILE="$MAGEN_LOG_FILE" MAGEN_SKIP_VALIDATION=1 "$_test_script" ${_test_args[@]+"${_test_args[@]}"} >&2; then
+            echo ""
+            echo "Error: magen validation failed. Run 'magen --self-test -v' for details." >&2
+            exit 1
+        fi
+    fi
+fi
+
+# --- Proxies (start before sandbox, killed on exit) ---
+start_npm_proxy || true
+start_docker_proxy || true
+start_azure_proxy || true
+
+# --- Dispatch to platform backend ---
+case "$OS" in
+    Linux)
+        # shellcheck source=lib/linux.sh
+        source "$SCRIPT_REAL_DIR/lib/linux.sh"
+        magen_linux
+        ;;
+    Darwin)
+        # shellcheck source=lib/macos.sh
+        source "$SCRIPT_REAL_DIR/lib/macos.sh"
+        magen_macos
+        ;;
+    *)
+        echo "Error: Unsupported OS '$OS'." >&2
+        echo "magen supports Linux (bubblewrap) and macOS (sandbox-exec)." >&2
+        exit 1
+        ;;
+esac
