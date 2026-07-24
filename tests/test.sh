@@ -181,6 +181,13 @@ PYEOF
     _FAKE_DAEMON_PID=$!
 }
 
+# Category toggles (parallel workers). Defaults: all on.
+CAT_SANDBOX=true
+CAT_AGENTS=true
+CAT_ISOLATION=true
+CAT_PROXIES=true
+CAT_LOCKDOWN=true
+
 show_help() {
     cat <<EOF
 Validates that the sandbox correctly isolates processes.
@@ -188,22 +195,63 @@ Validates that the sandbox correctly isolates processes.
 Usage: $(basename "$0") [OPTIONS]
 
 Options:
-    --normal-only     Run only normal mode tests
-    --lockdown-only   Run only lockdown mode tests
-    --verbose, -v     Show command, stdout, stderr and exit code per test
-    -h, --help        Show this help message
+    --normal-only           Run normal-mode categories (skip lockdown)
+    --lockdown-only         Run only lockdown tests
+    --category LIST         Comma-separated categories only:
+                            sandbox, agents, isolation, proxies, lockdown
+    --verbose, -v           Show command, stdout, stderr and exit code per test
+    -h, --help              Show this help message
+
+Categories run in parallel workers (each with its own TEMP dir).
 EOF
+}
+
+_set_categories_from_list() {
+    local list="$1" item
+    CAT_SANDBOX=false
+    CAT_AGENTS=false
+    CAT_ISOLATION=false
+    CAT_PROXIES=false
+    CAT_LOCKDOWN=false
+    IFS=',' read -r -a _cats <<<"$list"
+    for item in "${_cats[@]}"; do
+        item="${item#"${item%%[![:space:]]*}"}"
+        item="${item%"${item##*[![:space:]]}"}"
+        case "$item" in
+            sandbox) CAT_SANDBOX=true ;;
+            agents) CAT_AGENTS=true ;;
+            isolation) CAT_ISOLATION=true ;;
+            proxies) CAT_PROXIES=true ;;
+            lockdown) CAT_LOCKDOWN=true ;;
+            *)
+                echo "Error: unknown category '$item' (sandbox|agents|isolation|proxies|lockdown)" >&2
+                exit 1
+                ;;
+        esac
+    done
 }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --normal-only)
-            RUN_LOCKDOWN=false
+            CAT_LOCKDOWN=false
             shift
             ;;
         --lockdown-only)
-            RUN_NORMAL=false
+            CAT_SANDBOX=false
+            CAT_AGENTS=false
+            CAT_ISOLATION=false
+            CAT_PROXIES=false
+            CAT_LOCKDOWN=true
             shift
+            ;;
+        --category)
+            [ -n "${2:-}" ] || {
+                echo "Error: --category requires a list" >&2
+                exit 1
+            }
+            _set_categories_from_list "$2"
+            shift 2
             ;;
         --verbose | -v)
             VERBOSE=true
@@ -220,10 +268,13 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if ! $RUN_NORMAL && ! $RUN_LOCKDOWN; then
-    echo "Error: --normal-only and --lockdown-only are mutually exclusive" >&2
+if ! $CAT_SANDBOX && ! $CAT_AGENTS && ! $CAT_ISOLATION && ! $CAT_PROXIES && ! $CAT_LOCKDOWN; then
+    echo "Error: no test categories selected" >&2
     exit 1
 fi
+
+# Compatibility: magen --self-test still documents --normal-only / --lockdown-only.
+# Category flags above are the source of truth.
 
 # --- Pre-flight ---
 
@@ -282,17 +333,20 @@ STDERR_LOG="$TEST_DIR/stderr.log"
 trap 'rm -rf "$TEST_DIR"' EXIT
 echo "test-content" >"$TEST_DIR/test-file.txt"
 
-# Run sandbox from TEST_DIR (or --from); strip banner; stderr to STDERR_LOG; optional timeout.
+# Run sandbox from TEST_DIR (or --from); strip banner; stderr → $TEST_DIR/stderr.log
+# (or $MAGEN_RUN_STDERR). Path is fixed so callers after `out=$(magen_run …)` can grep it.
 magen_run() {
     local _wd="$TEST_DIR"
     if [[ "${1:-}" == "--from" ]]; then
         _wd="$2"
         shift 2
     fi
-    local _out _rc=0 _cmd=("$MAGEN" "$@")
+    local _out _rc=0 _cmd=("$MAGEN" "$@") _stderr
+    _stderr="${MAGEN_RUN_STDERR:-$TEST_DIR/stderr.log}"
+    STDERR_LOG="$_stderr"
     [ -n "$TIMEOUT_CMD" ] && _cmd=("$TIMEOUT_CMD" "$MAGEN_TIMEOUT" "${_cmd[@]}")
     $VERBOSE && echo -e "    ${YELLOW}> sandbox $*${NC}" >&2
-    _out=$( (cd "$_wd" && MAGEN_SKIP_VALIDATION=1 "${_cmd[@]}") 2>"$STDERR_LOG") || _rc=$?
+    _out=$( (cd "$_wd" && MAGEN_SKIP_VALIDATION=1 "${_cmd[@]}") 2>"$_stderr") || _rc=$?
     if [ -n "$_out" ]; then
         _out=$(printf '%s\n' "$_out" | grep -v '██' || true)
     fi
@@ -301,9 +355,9 @@ magen_run() {
             echo -e "    ${YELLOW}stdout:${NC}" >&2
             echo "$_out" | head -5 | sed 's/^/      /' >&2
         fi
-        if [ -s "$STDERR_LOG" ]; then
+        if [ -s "$_stderr" ]; then
             echo -e "    ${YELLOW}stderr:${NC}" >&2
-            head -5 "$STDERR_LOG" | sed 's/^/      /' >&2
+            head -5 "$_stderr" | sed 's/^/      /' >&2
         fi
         echo -e "    ${YELLOW}exit:${NC} $_rc" >&2
     fi
@@ -409,7 +463,7 @@ _normal_mode_fail_batch_hint() {
 # Normal mode: project read/write, system tools, git availability.
 # shellcheck disable=SC2016
 test_project_access() {
-    section "Normal Mode — Project access"
+    section "Sandbox — Project access"
     _normal_mode_run_batch_once
     local out="$NM_OUT"
 
@@ -436,7 +490,7 @@ test_project_access() {
 # Normal mode: $HOME/tmp isolation, denied dotdirs, SSH/browser paths, XDG, Docker/Azure sanitization.
 # shellcheck disable=SC2016
 test_filesystem_isolation() {
-    section "Normal Mode — Filesystem isolation"
+    section "Sandbox — Filesystem isolation"
     _normal_mode_run_batch_once
     local out="$NM_OUT"
 
@@ -522,7 +576,7 @@ test_filesystem_isolation() {
 
     if [[ "$OS" == "Darwin" ]]; then
         local lib_denied lib_key
-        for lib_denied in Mail Messages Keychains; do
+        for lib_denied in Mail Messages; do
             lib_key="LIB_$(printf '%s' "$lib_denied" | tr '[:lower:]' '[:upper:]')"
             if [ -d "$HOME/Library/$lib_denied" ]; then
                 assert_eq "Library/$lib_denied is blocked" "" "$(_val "$lib_key" "$out")"
@@ -530,6 +584,11 @@ test_filesystem_isolation() {
                 skip "Library/$lib_denied (not present on host)"
             fi
         done
+        if [ -d "$HOME/Library/Keychains" ]; then
+            assert_eq "Library/Keychains is blocked" "" "$(_val LIB_KEYCHAINS "$out")"
+        else
+            skip "Library/Keychains (not present on host)"
+        fi
         if [ -d "$HOME/Library/Preferences" ]; then
             local _lib_prefs
             _lib_prefs="$(_val LIB_PREFS "$out")"
@@ -588,7 +647,7 @@ test_filesystem_isolation() {
 # Normal mode: MAGEN_ACTIVE, hostname, stripped secrets, DNS; macOS HTTPS smoke when online.
 # shellcheck disable=SC2016
 test_environment() {
-    section "Normal Mode — Environment"
+    section "Sandbox — Environment"
     _normal_mode_run_batch_once
     local out="$NM_OUT"
 
@@ -633,10 +692,81 @@ test_environment() {
     section_end
 }
 
+# Agent recipes: command-scoped homes / SET_ENV; sh -c keeps agent homes hidden.
+# Three sandboxes run in parallel to cut wall-clock time.
+# shellcheck disable=SC2016
+test_agent_recipes() {
+    section "Agents — recipes"
+    local _adir _out_agent _out_claude _out_shc
+    local _f_agent _f_claude _f_shc _p_agent _p_claude _p_shc
+
+    mkdir -p /tmp/magen/sandbox
+    _adir=$(mktemp -d /tmp/magen/sandbox/agent-test.XXXXXX) || {
+        skip "agent recipe checks (mktemp failed)"
+        section_end
+        return
+    }
+    printf '%s\n' '#!/bin/sh' \
+        'printf "AGENT_CLI=%s\n" "${AGENT_CLI_CREDENTIAL_STORE:-unset}"' \
+        'printf "OPENAI=%s\n" "${OPENAI_API_KEY:-unset}"' \
+        'printf "AZURE_SECRET=%s\n" "${AZURE_CLIENT_SECRET:-unset}"' \
+        'printf "CLAUDE_HOME=%s\n" "$([ -d "$HOME/.claude" ] && echo visible || echo hidden)"' \
+        >"$_adir/agent"
+    printf '%s\n' '#!/bin/sh' \
+        'printf "CLAUDE_HOME=%s\n" "$([ -d "$HOME/.claude" ] && echo visible || echo hidden)"' \
+        >"$_adir/claude"
+    chmod +x "$_adir/agent" "$_adir/claude"
+
+    _f_agent="$TEST_DIR/agent-recipe.out"
+    _f_claude="$TEST_DIR/claude-recipe.out"
+    _f_shc="$TEST_DIR/shc-recipe.out"
+
+    (MAGEN_RUN_STDERR="$TEST_DIR/agent.err" OPENAI_API_KEY=keep-me AZURE_CLIENT_SECRET=strip-me \
+        magen_run "$_adir/agent" >"$_f_agent" || true) &
+    _p_agent=$!
+    if [ -d "$HOME/.claude" ]; then
+        (MAGEN_RUN_STDERR="$TEST_DIR/claude.err" magen_run "$_adir/claude" >"$_f_claude" || true) &
+        _p_claude=$!
+    else
+        _p_claude=""
+    fi
+    (MAGEN_RUN_STDERR="$TEST_DIR/shc.err" magen_run sh -c \
+        'printf "CLAUDE_HOME=%s\n" "$([ -d "$HOME/.claude" ] && echo visible || echo hidden)"' \
+        >"$_f_shc" || true) &
+    _p_shc=$!
+
+    wait "$_p_agent" || true
+    [ -n "$_p_claude" ] && wait "$_p_claude" || true
+    wait "$_p_shc" || true
+
+    _out_agent=$(cat "$_f_agent" 2>/dev/null || true)
+    assert_eq "cursor recipe sets AGENT_CLI_CREDENTIAL_STORE=file" "file" "$(_val AGENT_CLI "$_out_agent")"
+    assert_eq "GLOBAL_PASS_ENV keeps OPENAI_API_KEY" "keep-me" "$(_val OPENAI "$_out_agent")"
+    assert_eq "non-allowlisted AZURE_CLIENT_SECRET stripped" "unset" "$(_val AZURE_SECRET "$_out_agent")"
+    assert_eq "cursor recipe does not mount .claude" "hidden" "$(_val CLAUDE_HOME "$_out_agent")"
+
+    if [ -d "$HOME/.claude" ]; then
+        _out_claude=$(cat "$_f_claude" 2>/dev/null || true)
+        assert_eq "claude recipe mounts .claude" "visible" "$(_val CLAUDE_HOME "$_out_claude")"
+    else
+        skip "claude recipe mounts .claude (not present on host)"
+    fi
+
+    _out_shc=$(cat "$_f_shc" 2>/dev/null || true)
+    if [ -d "$HOME/.claude" ]; then
+        assert_eq "sh -c does not activate agent homes" "hidden" "$(_val CLAUDE_HOME "$_out_shc")"
+    else
+        skip "sh -c agent-home isolation (.claude not present on host)"
+    fi
+
+    rm -rf "$_adir"
+    section_end
+}
+
 # Normal mode: project-dir secret globs masked (Linux); macOS SBPL regex parity for /tmp.
 # shellcheck disable=SC2016
 test_sensitive_files() {
-    section "Normal Mode — Sensitive files"
+    section "Sandbox — Sensitive files"
     _normal_mode_run_batch_once
     local out="$NM_OUT"
 
@@ -702,33 +832,42 @@ test_sensitive_files() {
     section_end
 }
 
-# Normal mode: session log file appears under ~/.local/state/magen/sandbox/logs (Linux).
+# Normal mode: session log under ~/.local/state/magen/sandbox/logs (Linux + macOS).
+# Linux also checks bashrc EXIT-trap stderr flush (macOS cmd-logger has no stderr tee).
 test_session_logging() {
-    section "Normal Mode — Session logging"
-    _normal_mode_run_batch_once
+    section "Isolation — Session logging"
 
-    if ! $NM_BATCH_OK; then
-        skip "session log checks (normal mode batch unavailable)"
-        section_end
-        return
+    local _log_dir="$HOME/.local/state/magen/sandbox/logs"
+    mkdir -p "$_log_dir"
+
+    local _test_log
+    _test_log="$(mktemp "$_log_dir/sess-test.XXXXXX")"
+
+    local _rc=0
+    (cd "$TEST_DIR" && MAGEN_SKIP_VALIDATION=1 MAGEN_LOG_FILE="$_test_log" "$MAGEN" sh -c 'echo session-log-probe') \
+        >/dev/null 2>"$STDERR_LOG" || _rc=$?
+
+    if [ -s "$_test_log" ] && grep -q '=== Sandbox Session ===' "$_test_log" 2>/dev/null; then
+        pass "Session log created with header"
+    else
+        fail "Session log created with header"
+        $VERBOSE && {
+            echo "    log=$_test_log rc=$_rc size=$(wc -c <"$_test_log" 2>/dev/null || echo 0)" >&2
+            head -20 "$_test_log" 2>/dev/null | sed 's/^/      /' >&2
+        }
     fi
 
-    if [[ "$OS" == "Linux" ]]; then
-        local _log_dir="$HOME/.local/state/magen/sandbox/logs"
-        if [ -d "$_log_dir" ]; then
-            local _latest
-            _latest=$(find "$_log_dir" -name '*.log' -maxdepth 1 -newer "$STDERR_LOG" 2>/dev/null | head -1)
-            if [ -n "$_latest" ] && [ -s "$_latest" ]; then
-                pass "Session log created and non-empty"
-            else
-                skip "Session log (could not verify — timing issue)"
-            fi
-        else
-            skip "Session log (directory not found)"
-        fi
+    if [ -s "$_test_log" ] && grep -qE 'Mode:[[:space:]]+(normal|lockdown)' "$_test_log" 2>/dev/null; then
+        pass "Session log records mode"
+    else
+        fail "Session log records mode"
+    fi
 
-        # Simulate: command fails, shell exits before PROMPT_COMMAND fires.
-        # The EXIT trap must flush the remaining stderr to the session log.
+    rm -f "$_test_log"
+
+    # Linux-only: EXIT trap must flush remaining stderr when the shell exits
+    # before PROMPT_COMMAND (uses the with-stderr bashrc wrapper).
+    if [[ "$OS" == "Linux" ]]; then
         local _exit_log
         _exit_log=$(mktemp /tmp/sandbox-exit-log-test.XXXXXX)
         MAGEN_SESSION_LOG="$_exit_log" bash --norc --noprofile <<'EXITEOF' 2>/dev/null || true
@@ -758,7 +897,7 @@ trap '_sandbox_on_exit' EXIT
 echo "DOCKER_BUILD_ERROR: nginx.conf not found" >&2
 exit 1
 EXITEOF
-        sleep 0.15
+        sleep 0.05
         if [ -s "$_exit_log" ] && grep -q "DOCKER_BUILD_ERROR" "$_exit_log" 2>/dev/null; then
             pass "EXIT trap flushes stderr on early exit"
         else
@@ -770,8 +909,6 @@ EXITEOF
             fail "EXIT trap logs exit code"
         fi
         rm -f "$_exit_log"
-    else
-        skip "Session log (Linux only in this suite)"
     fi
 
     section_end
@@ -781,22 +918,20 @@ EXITEOF
 # Home Directory Isolation
 # =============================================================================
 
-# Linux: repo under $HOME keeps tmpfs isolation (dotdirs hidden, no leak to real $HOME).
+# Project under $HOME: isolation must still hide non-allowlisted dotdirs and
+# prevent host $HOME pollution.
+#   Linux  — ephemeral tmpfs $HOME (writes succeed inside, never hit the host)
+#   macOS  — Seatbelt deny-default (writes to non-allowlisted home paths fail)
 
 # shellcheck disable=SC2016
 test_home_project_isolation() {
-    section "Home Directory Isolation (project under \$HOME)"
+    section "Isolation — Home project"
 
-    if [[ "$OS" != "Linux" ]]; then
-        skip "Home dir isolation (Linux only)"
-        section_end
-        return
-    fi
-
-    local _htd="$HOME/.sandbox-iso-test-$$"
+    local _htd="$HOME/.magen-iso-test-$$"
     local _hpd="$_htd/project"
     mkdir -p "$_hpd"
     echo "home-test" >"$_hpd/test-file.txt"
+    rm -f "$HOME/.eph-marker" 2>/dev/null || true
 
     local out
     out=$(magen_run --from "$_hpd" sh -c '
@@ -807,6 +942,7 @@ test_home_project_isolation() {
         printf "WR=%s\n" "$(echo ok > write-check.txt 2>/dev/null && echo ok || echo denied)"
         printf "PARENT=%s\n" "$(touch ../parent-write-check 2>/dev/null && echo rw || echo ro)"
         touch "$HOME/.eph-marker" 2>/dev/null
+        printf "HOME_WRITE=%s\n" "$([ -f "$HOME/.eph-marker" ] && echo wrote || echo blocked)"
         printf "_OK=1\n"
     ') || true
 
@@ -840,11 +976,18 @@ test_home_project_isolation() {
         assert_eq "Project writable (\$HOME project)" "ok" "$(_val WR "$out")"
         assert_eq "Parent dir writable (\$HOME project)" "rw" "$(_val PARENT "$out")"
 
+        # Host must never see the marker. On Linux the write hit tmpfs; on macOS
+        # Seatbelt blocks the write (HOME_WRITE=blocked) or it stays ephemeral.
         if [ ! -f "$HOME/.eph-marker" ]; then
             pass "\$HOME writes don't leak (\$HOME project)"
         else
             fail "\$HOME writes don't leak (\$HOME project)"
             rm -f "$HOME/.eph-marker"
+        fi
+
+        if [[ "$OS" == "Darwin" ]]; then
+            # Extra macOS signal: writing directly under $HOME should be denied.
+            assert_eq "\$HOME root write blocked (Seatbelt)" "blocked" "$(_val HOME_WRITE "$out")"
         fi
     fi
 
@@ -859,7 +1002,7 @@ test_home_project_isolation() {
 # GUI dry-run: Linux Chromium gets --no-sandbox and no --die-with-parent; macOS Electron + SBPL allowances.
 # shellcheck disable=SC2016
 test_gui_mode() {
-    section "GUI / Background Mode"
+    section "Isolation — GUI / background"
 
     if [[ "$OS" == "Linux" ]]; then
         local fake_app_dir="$TEST_DIR/fake-chromium"
@@ -907,7 +1050,7 @@ test_gui_mode() {
         local gui_dry_out
         gui_dry_out=$(magen_run --dry-run --verbose fake-electron) || true
 
-        if grep -q 'gui:.*Electron binary.*--no-sandbox' "$STDERR_LOG"; then
+        if grep -q 'gui:.*Electron binary.*--no-sandbox' "$TEST_DIR/stderr.log"; then
             pass "macOS Electron app detected and --no-sandbox logged"
         else
             fail "macOS Electron app detected and --no-sandbox logged"
@@ -966,10 +1109,10 @@ _docker_proxy_stop_main() {
     wait "${_DOCKER_MAIN_FAKE_PID:-}" 2>/dev/null || true
 }
 
-# docker-proxy: safe container/volume/network creates and passthrough requests return 200.
+# docker-proxy: allowlist + denylist + exec/auth (single proxy lifecycle for speed).
 # shellcheck disable=SC2016
-test_docker_basic() {
-    section "Docker Proxy — Basic"
+test_docker_proxy() {
+    section "Proxies — Docker"
 
     if ! command -v python3 &>/dev/null; then
         skip "Docker proxy tests (python3 not found)"
@@ -1024,42 +1167,6 @@ test_docker_basic() {
     assert_docker "Allows bridge network driver" "200" \
         POST "networks/create" \
         '{"Name":"safe-net","Driver":"bridge"}'
-
-    _docker_proxy_stop_main
-    rm -f "$_proxy_sock" "$_target_sock"
-
-    section_end
-}
-
-# docker-proxy blocks privilege, bad mounts, namespaces, restart policies, and risky API paths.
-# shellcheck disable=SC2016
-test_docker_security() {
-    section "Docker Proxy — Security"
-
-    if ! command -v python3 &>/dev/null; then
-        skip "Docker proxy tests (python3 not found)"
-        section_end
-        return
-    fi
-
-    if ! command -v curl &>/dev/null; then
-        skip "Docker proxy tests (curl not found)"
-        section_end
-        return
-    fi
-
-    local _proxy_sock="$TEST_DIR/docker-proxy.sock"
-    local _target_sock="$TEST_DIR/docker-fake.sock"
-    _DOCKER_MAIN_PROXY_PID=""
-    _DOCKER_MAIN_FAKE_PID=""
-
-    if ! _docker_proxy_start_main "$_proxy_sock" "$_target_sock"; then
-        fail "Docker proxy failed to start"
-        kill "$_DOCKER_MAIN_FAKE_PID" 2>/dev/null || true
-        wait "$_DOCKER_MAIN_FAKE_PID" 2>/dev/null || true
-        section_end
-        return
-    fi
 
     subgroup "Container security"
     assert_docker "Blocks mount to denied path" "403" \
@@ -1173,47 +1280,13 @@ test_docker_security() {
         POST "configs/create" \
         '{"Name":"evil-config","Data":"c2VjcmV0"}'
 
+    subgroup "Exec (allowed)"
+    assert_docker "Allows non-privileged exec" "200" \
+        POST "containers/test123/exec" \
+        '{"Cmd":["date"]}'
+
     _docker_proxy_stop_main
     rm -f "$_proxy_sock" "$_target_sock"
-
-    section_end
-}
-
-# docker-proxy: non-privileged exec allowed; X-Registry-Auth injection only for known registries.
-# shellcheck disable=SC2016
-test_docker_advanced() {
-    section "Docker Proxy — Advanced"
-
-    if ! command -v python3 &>/dev/null; then
-        skip "Docker proxy tests (python3 not found)"
-        section_end
-        return
-    fi
-
-    if ! command -v curl &>/dev/null; then
-        skip "Docker proxy tests (curl not found)"
-        section_end
-        return
-    fi
-
-    local _proxy_sock="$TEST_DIR/docker-proxy-adv.sock"
-    local _target_sock="$TEST_DIR/docker-fake-adv.sock"
-    _DOCKER_MAIN_PROXY_PID=""
-    _DOCKER_MAIN_FAKE_PID=""
-
-    if _docker_proxy_start_main "$_proxy_sock" "$_target_sock"; then
-        subgroup "Exec (allowed)"
-        assert_docker "Allows non-privileged exec" "200" \
-            POST "containers/test123/exec" \
-            '{"Cmd":["date"]}'
-        _docker_proxy_stop_main
-        rm -f "$_proxy_sock" "$_target_sock"
-    else
-        skip "Exec tests (Docker proxy failed to start)"
-        kill "$_DOCKER_MAIN_FAKE_PID" 2>/dev/null || true
-        wait "$_DOCKER_MAIN_FAKE_PID" 2>/dev/null || true
-        rm -f "$_proxy_sock" "$_target_sock"
-    fi
 
     subgroup "Registry auth injection"
     local _test_docker_config
@@ -1247,7 +1320,7 @@ print(json.dumps(config))
     if [ -S "$_proxy_sock2" ]; then
         curl -s -o /dev/null --unix-socket "$_proxy_sock2" \
             -X POST "http://localhost/v1.45/images/create?fromImage=test-reg.example.com%2Fmyimage&tag=latest" 2>/dev/null
-        sleep 0.1
+        sleep 0.05
 
         if [ -f "$_auth_capture" ] && [ -s "$_auth_capture" ]; then
             local _decoded_user
@@ -1266,7 +1339,7 @@ print(data.get("username", ""))
         : >"$_auth_capture"
         curl -s -o /dev/null --unix-socket "$_proxy_sock2" \
             -X POST "http://localhost/v1.45/images/create?fromImage=unknown-reg.io%2Fimg&tag=v1" 2>/dev/null
-        sleep 0.1
+        sleep 0.05
 
         local _no_auth
         _no_auth=$(cat "$_auth_capture" 2>/dev/null)
@@ -1290,7 +1363,7 @@ print(data.get("username", ""))
 # npm_registry proxy: forwards GET with auth, blocks mutating methods, writes registry env file.
 # shellcheck disable=SC2016
 test_npm_proxy() {
-    section "npm Registry Proxy"
+    section "Proxies — npm"
 
     if ! command -v python3 &>/dev/null; then
         skip "npm proxy tests (python3 not found)"
@@ -1421,7 +1494,7 @@ EOF
 # Azure CLI proxy: allowed commands forwarded, credential-exposing commands blocked.
 # shellcheck disable=SC2016,SC2154
 test_azure_proxy() {
-    section "Azure CLI Proxy"
+    section "Proxies — Azure CLI"
 
     if ! command -v python3 &>/dev/null; then
         skip "Azure proxy tests (python3 not found)"
@@ -1553,7 +1626,7 @@ PYEOF
 # Lockdown: read-only project, minimal PATH, no secret env leak, blocked network when host can reach internet.
 # shellcheck disable=SC2016
 test_lockdown_mode() {
-    section "Lockdown Mode"
+    section "Lockdown"
 
     local out
 
@@ -1650,66 +1723,126 @@ test_lockdown_mode() {
 }
 
 # =============================================================================
-# Run
+# Parallel category runner
 # =============================================================================
 
-if $RUN_NORMAL; then
-    # Proxy tests (Docker, npm, Azure) are independent of sandbox (bwrap)
-    # tests. Run them in a background subshell to cut wall-clock time.
-    _PAR_OUT=$(mktemp "$TEST_DIR/par-out.XXXXXX")
-    _PAR_STATS=$(mktemp "$TEST_DIR/par-stats.XXXXXX")
-    # shellcheck disable=SC2030  # subshell locals collected via _PAR_STATS file
+_WPIDS=()
+_WOUTS=()
+_WSTATS=()
+
+# Spawn a category worker with its own TEST_DIR (avoids cwd races).
+# Args: display-name then test functions to run.
+_spawn_category() {
+    local _name="$1"
+    shift
+    local _wdir _out _stats
+    _wdir=$(mktemp -d /var/tmp/magen-sandbox-test.XXXXXX)
+    echo "test-content" >"$_wdir/test-file.txt"
+    _out=$(mktemp "$TEST_DIR/wout.XXXXXX")
+    _stats=$(mktemp "$TEST_DIR/wstats.XXXXXX")
+    # shellcheck disable=SC2030
     (
         set +e
-        PASS=0 FAIL=0 SKIP=0 SUITE_PASS=0 SUITE_FAIL=0
+        TEST_DIR="$_wdir"
+        STDERR_LOG="$_wdir/stderr.log"
+        NM_BATCH_OK=false
+        _NM_BATCH_RAN=""
+        NM_OUT=""
+        NM_SENSITIVE_FILES=()
+        NM_TMP_LEAK=""
+        PASS=0
+        FAIL=0
+        SKIP=0
+        SUITE_PASS=0
+        SUITE_FAIL=0
         FAILURES=()
-
-        test_docker_basic
-        test_docker_security
-        test_docker_advanced
-        test_npm_proxy
-        test_azure_proxy
-
-        # Bash 3.2 (macOS) treats empty "${arr[@]}" as unbound under set -u.
+        printf '\n%s━━ %s ━━%s\n' "$BOLD" "$_name" "$NC"
+        "$@"
         {
             echo "$PASS $FAIL $SKIP $SUITE_PASS $SUITE_FAIL"
             if [ ${#FAILURES[@]} -gt 0 ]; then
                 printf '%s\n' "${FAILURES[@]}"
             fi
-        } >"$_PAR_STATS"
+        } >"$_stats"
+        rm -rf "$_wdir"
         exit 0
-    ) >"$_PAR_OUT" 2>/dev/null &
-    _PAR_PID=$!
+    ) >"$_out" 2>&1 &
+    _WPIDS+=("$!")
+    _WOUTS+=("$_out")
+    _WSTATS+=("$_stats")
+}
 
+_await_categories() {
+    local _i=0 _n=${#_WPIDS[@]} _pp _pf _ps _psp _psf _fl
+    while [ "$_i" -lt "$_n" ]; do
+        wait "${_WPIDS[$_i]}" || true
+        cat "${_WOUTS[$_i]}"
+        # shellcheck disable=SC2031
+        if [ -s "${_WSTATS[$_i]}" ]; then
+            {
+                read -r _pp _pf _ps _psp _psf || true
+                PASS=$((PASS + ${_pp:-0}))
+                FAIL=$((FAIL + ${_pf:-0}))
+                SKIP=$((SKIP + ${_ps:-0}))
+                SUITE_PASS=$((SUITE_PASS + ${_psp:-0}))
+                SUITE_FAIL=$((SUITE_FAIL + ${_psf:-0}))
+                while IFS= read -r _fl || [ -n "${_fl:-}" ]; do
+                    [ -n "${_fl:-}" ] && FAILURES+=("$_fl")
+                done
+            } <"${_WSTATS[$_i]}"
+        fi
+        rm -f "${_WOUTS[$_i]}" "${_WSTATS[$_i]}"
+        _i=$((_i + 1))
+    done
+    _WPIDS=()
+    _WOUTS=()
+    _WSTATS=()
+}
+
+_run_sandbox_category() {
     test_project_access
     test_filesystem_isolation
     test_environment
     test_sensitive_files
+}
+
+_run_agents_category() {
+    test_agent_recipes
+}
+
+_run_isolation_category() {
     test_session_logging
     test_home_project_isolation
     test_gui_mode
+}
 
-    # Parallel suite may exit non-zero on older bash; still merge its output.
-    wait "$_PAR_PID" || true
-    cat "$_PAR_OUT"
-    # shellcheck disable=SC2031  # intentional: merging counts from subshell via file
-    if [ -s "$_PAR_STATS" ]; then
-        {
-            read -r _pp _pf _ps _psp _psf || true
-            PASS=$((PASS + ${_pp:-0}))
-            FAIL=$((FAIL + ${_pf:-0}))
-            SKIP=$((SKIP + ${_ps:-0}))
-            SUITE_PASS=$((SUITE_PASS + ${_psp:-0}))
-            SUITE_FAIL=$((SUITE_FAIL + ${_psf:-0}))
-            while IFS= read -r _fl || [ -n "${_fl:-}" ]; do
-                [ -n "${_fl:-}" ] && FAILURES+=("$_fl")
-            done
-        } <"$_PAR_STATS"
-    fi
+_run_proxies_docker() {
+    test_docker_proxy
+}
 
-    rm -f "$_PAR_OUT" "$_PAR_STATS"
+_run_proxies_npm() {
+    test_npm_proxy
+}
+
+_run_proxies_azure() {
+    test_azure_proxy
+}
+
+# =============================================================================
+# Run
+# =============================================================================
+
+$CAT_SANDBOX && _spawn_category "Sandbox" _run_sandbox_category
+$CAT_AGENTS && _spawn_category "Agents" _run_agents_category
+$CAT_ISOLATION && _spawn_category "Isolation" _run_isolation_category
+if $CAT_PROXIES; then
+    _spawn_category "Proxies · Docker" _run_proxies_docker
+    _spawn_category "Proxies · npm" _run_proxies_npm
+    _spawn_category "Proxies · Azure" _run_proxies_azure
 fi
-$RUN_LOCKDOWN && test_lockdown_mode
+$CAT_LOCKDOWN && _spawn_category "Lockdown" test_lockdown_mode
+
+_await_categories
 
 # =============================================================================
 # Summary

@@ -34,14 +34,23 @@ magen_macos() {
 
     # Assemble PROFILE: allowlists, dotdirs, denies (order matters — last match wins in SBPL).
     _sbpl_build_profile() {
-        PROFILE='(version 1)
+        # realpath(1)/realpath(3) needs file-read-metadata on path ancestors
+        # (/, parent of $HOME, $HOME). Keep this scoped to literals so
+        # non-allowlisted home dirs (e.g. .aws) stay invisible to [ -d ] / stat.
+        local _home_lit _home_parent_lit
+        _home_lit="$(sanitize_path "$HOME")"
+        _home_parent_lit="$(sanitize_path "$(dirname "$HOME")")"
+        PROFILE="(version 1)
 (deny default)
 (allow process*)
 (allow signal)
 (allow sysctl-read)
+(allow file-read-metadata (literal \"/\"))
+(allow file-read-metadata (literal \"${_home_parent_lit}\"))
+(allow file-read-metadata (literal \"${_home_lit}\"))
 (allow mach-lookup)
 (allow ipc-posix*)
-(allow system-socket)'
+(allow system-socket)"
 
         if $LOCKDOWN; then
             log "lockdown: network disabled"
@@ -49,6 +58,7 @@ magen_macos() {
             sbpl '(allow network*)'
         fi
 
+        # Base filesystem allows (TTY/PTY rules added separately — scoped).
         PROFILE+=$'\n''
 (allow file-read* (literal "/"))
 (allow file-read* (subpath "/usr"))
@@ -62,7 +72,6 @@ magen_macos() {
 (allow file-write* (literal "/dev/random"))
 (allow file-write* (literal "/dev/urandom"))
 (allow file-write* (subpath "/dev/fd"))
-(allow file-write* (regex #"^/dev/(pty|ttys)"))
 (allow file-read* (subpath "/Applications"))
 (allow file-read* (subpath "/etc"))
 (allow file-read* (subpath "/var"))
@@ -73,6 +82,21 @@ magen_macos() {
 (allow file-read* file-write* (regex #"^/private/var/folders/"))
 (allow file-read* (subpath "/opt/homebrew"))
 (allow file-read* (subpath "/usr/local"))'
+
+        # TTY/PTY: only when stdin is a real TTY, and only for this session's
+        # device + /dev/ptmx (not every /dev/ttys*). Avoids setRawMode EPERM
+        # for interactive CLIs without exposing all user terminals.
+        if ! $LOCKDOWN && [ -t 0 ]; then
+            _tty_dev="$(tty 2>/dev/null || true)"
+            if [[ -n "$_tty_dev" && -e "$_tty_dev" ]]; then
+                sbpl '(allow pseudo-tty)'
+                sbpl '(allow file-ioctl (literal "/dev/ptmx") (literal "/dev/tty"))'
+                sbpl "(allow file-ioctl (literal \"$(sanitize_path "$_tty_dev")\"))"
+                sbpl '(allow file-read* file-write* (literal "/dev/ptmx") (literal "/dev/tty"))'
+                sbpl "(allow file-read* file-write* (literal \"$(sanitize_path "$_tty_dev")\"))"
+                log "tty: PTY allowed for $_tty_dev"
+            fi
+        fi
 
         if $LOCKDOWN; then
             sbpl_ro "$PROJECT_DIR"
@@ -137,6 +161,11 @@ magen_macos() {
                         sbpl_rw "$HOME/Library/Application Support/$d"
                     fi
                 done
+                # Opt-in only: full keychain access is high risk (exposes all secrets).
+                if ${ALLOW_KEYCHAIN:-false} && [ -d "$HOME/Library/Keychains" ]; then
+                    sbpl_rw "$HOME/Library/Keychains"
+                    log "keychain: ~/Library/Keychains mounted (--allow-keychain)"
+                fi
             fi
         else
             log "lockdown: no dotfiles, no extra maps"
@@ -235,7 +264,9 @@ magen_macos() {
     }
 
     # Match Linux: strip secret-like env, colors, proxies, sanitized Docker/npm config, BASH_ENV logger.
+    # macOS /usr/bin/env requires all -u options BEFORE any VAR=value assignments.
     _macos_prep_env() {
+        local -a _env_unset=() _env_set=()
         _macos_env_args=()
         _MACOS_DOCKER_CFG_DIR=""
         _MACOS_NPMRC=""
@@ -247,34 +278,61 @@ magen_macos() {
                     if _is_env_safe "$_var"; then
                         log "env: kept $_var (safe)"
                     else
-                        _macos_env_args+=(-u "$_var")
+                        _env_unset+=(-u "$_var")
                     fi
                 done < <(compgen -A export "$_prefix" 2>/dev/null)
             done
 
-            _macos_env_args+=(-u NO_COLOR -u FORCE_COLOR)
+            # Color env: strip IDE pollution (NO_COLOR / FORCE_COLOR=0) but do NOT
+            # force truecolor. Apple Terminal cannot render 24-bit escapes well;
+            # chalk/ink should auto-detect via TERM + TERM_PROGRAM.
+            _macos_term="${TERM:-xterm-256color}"
+            [[ "$_macos_term" == "dumb" ]] && _macos_term=xterm-256color
+            _env_unset+=(-u NO_COLOR -u FORCE_COLOR)
+            # Keep host COLORTERM only when the terminal actually advertised it
+            # (iTerm/Kitty/etc.). Never invent COLORTERM=truecolor for Apple Terminal.
+            if [[ -n "${COLORTERM:-}" && "$_macos_term" != "dumb" ]]; then
+                _env_set+=("COLORTERM=$COLORTERM")
+            else
+                _env_unset+=(-u COLORTERM)
+            fi
+            _env_set+=("TERM=$_macos_term")
             if [ -t 1 ]; then
-                _macos_env_args+=("FORCE_COLOR=1" "COLORTERM=truecolor" "DOCKER_CLI_COLOR=always")
-                log "env: color enabled (TTY detected)"
+                _env_set+=("DOCKER_CLI_COLOR=always")
+                log "env: color auto-detect (TERM=$_macos_term, TERM_PROGRAM=${TERM_PROGRAM:-unset}, COLORTERM=${COLORTERM:-unset})"
             fi
 
-            _macos_env_args+=("DOTNET_BUNDLE_EXTRACT_BASE_DIR=/tmp/.dotnet-bundle-extract")
+            # Agent recipes: materialize keychain→file exports; apply SET_ENV.
+            # --allow-keychain skips materialize and mounts Keychains instead.
+            if ! ${ALLOW_KEYCHAIN:-false}; then
+                agents_materialize_keychain
+            else
+                log "auth: using host keychain inside sandbox (--allow-keychain)"
+            fi
+            local _se
+            for _se in ${_AGENTS_SET_ENV[@]+"${_AGENTS_SET_ENV[@]}"}; do
+                if [[ "$_se" == *=* ]]; then
+                    _env_set+=("$_se")
+                fi
+            done
+
+            _env_set+=("DOTNET_BUNDLE_EXTRACT_BASE_DIR=/tmp/.dotnet-bundle-extract")
 
             if [ -n "$DOCKER_PROXY_SOCK" ] && [ -S "$DOCKER_PROXY_SOCK" ]; then
-                _macos_env_args+=("DOCKER_HOST=unix://$DOCKER_PROXY_SOCK")
+                _env_set+=("DOCKER_HOST=unix://$DOCKER_PROXY_SOCK")
             fi
 
             if [ -f "$HOME/.docker/config.json" ] && command -v python3 &>/dev/null; then
                 _MACOS_DOCKER_CFG_DIR=$(mktemp -d /tmp/magen/sandbox/docker-cfg.XXXXXX)
                 _sanitize_docker_config "$HOME/.docker/config.json" "$_MACOS_DOCKER_CFG_DIR/config.json"
-                _macos_env_args+=("DOCKER_CONFIG=$_MACOS_DOCKER_CFG_DIR")
+                _env_set+=("DOCKER_CONFIG=$_MACOS_DOCKER_CFG_DIR")
                 log "ro: docker config sanitized (auth stripped)"
             fi
 
             if [ -n "$NPM_PROXY_PID" ] && [ -s "$NPM_PROXY_ENV_FILE" ]; then
                 while IFS=$'\t' read -r _key _val; do
                     if [ -n "$_key" ]; then
-                        _macos_env_args+=("$_key=$_val")
+                        _env_set+=("$_key=$_val")
                     fi
                 done <"$NPM_PROXY_ENV_FILE"
                 log "npm proxy: env vars injected"
@@ -282,8 +340,8 @@ magen_macos() {
 
             # Azure token proxy: prepend wrapper dir to PATH so `az` resolves to the proxy shim.
             if [ -n "$AZURE_PROXY_PID" ] && [ -S "$AZURE_PROXY_SOCK" ]; then
-                _macos_env_args+=("AZURE_CLI_PROXY_SOCK=$AZURE_PROXY_SOCK")
-                _macos_env_args+=("PATH=${AZURE_PROXY_WRAPPER_DIR}:${PATH}")
+                _env_set+=("AZURE_CLI_PROXY_SOCK=$AZURE_PROXY_SOCK")
+                _env_set+=("PATH=${AZURE_PROXY_WRAPPER_DIR}:${PATH}")
                 log "azure: CLI proxy → $AZURE_PROXY_SOCK (az wrapper prepended to PATH)"
             fi
 
@@ -297,7 +355,7 @@ magen_macos() {
                         printf '%s=%s\n' "$_npmrc_key" "$_val" >>"$_MACOS_NPMRC"
                     done <"$NPM_PROXY_ENV_FILE"
                 fi
-                _macos_env_args+=("NPM_CONFIG_USERCONFIG=$_MACOS_NPMRC")
+                _env_set+=("NPM_CONFIG_USERCONFIG=$_MACOS_NPMRC")
                 log "ro: ~/.npmrc sanitized (auth tokens stripped)"
             fi
 
@@ -305,7 +363,7 @@ magen_macos() {
             _write_cmd_logger "$TEMP_CMD_LOGGER_MAC"
             # Pass the logger script directly via ENV and BASH_ENV (read by sh/bash)
             # And add an alias/wrapper to the PATH or inject via ZDOTDIR, forcing ~/.zshrc to be read
-            _macos_env_args+=("ENV=$TEMP_CMD_LOGGER_MAC" "BASH_ENV=$TEMP_CMD_LOGGER_MAC")
+            _env_set+=("ENV=$TEMP_CMD_LOGGER_MAC" "BASH_ENV=$TEMP_CMD_LOGGER_MAC")
 
             TEMP_ZSHENV_MAC=$(mktemp -d /tmp/magen/sandbox/zsh.XXXXXX)
             cat >"$TEMP_ZSHENV_MAC/.zshrc" <<ZSHRC
@@ -316,12 +374,14 @@ magen_macos() {
 preexec_functions+=(_sandbox_zsh_logger)
 
 export CLICOLOR=1
-export FORCE_COLOR=1
-export COLORTERM=truecolor
-export TERM="${TERM:-xterm-256color}"
+export TERM="${_macos_term:-${TERM:-xterm-256color}}"
+unset FORCE_COLOR NO_COLOR
 ZSHRC
 
-            _macos_env_args+=("ZDOTDIR=$TEMP_ZSHENV_MAC" "BASH_ENV=$TEMP_CMD_LOGGER_MAC")
+            _env_set+=("ZDOTDIR=$TEMP_ZSHENV_MAC" "BASH_ENV=$TEMP_CMD_LOGGER_MAC")
+
+            # -u flags MUST precede VAR=value for macOS /usr/bin/env.
+            _macos_env_args=("${_env_unset[@]+"${_env_unset[@]}"}" "${_env_set[@]+"${_env_set[@]}"}")
         fi
     }
 
@@ -390,7 +450,7 @@ ZSHRC
             MAGEN_ACTIVE=1 \
             MAGEN_SESSION_LOG="${SESSION_LOG_FIFO:-$MAGEN_LOG_FILE}" \
                 env ${_macos_env_args[@]+"${_macos_env_args[@]}"} \
-                CLICOLOR=1 FORCE_COLOR=1 COLORTERM=truecolor TERM="${TERM:-xterm-256color}" \
+                CLICOLOR=1 TERM="${_macos_term:-${TERM:-xterm-256color}}" \
                 sandbox-exec -f "$TEMP_PROFILE" "${COMMAND_ARGS[@]}"
         fi
     }

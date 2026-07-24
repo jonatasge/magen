@@ -67,6 +67,7 @@ _show_banner() {
 LOCKDOWN=false
 DRY_RUN=false
 VERBOSE=false
+ALLOW_KEYCHAIN=false
 EXTRA_RO_MAPS=()
 EXTRA_RW_MAPS=()
 
@@ -77,19 +78,23 @@ magen — OS-level sandbox for AI coding agents
 Usage: magen [OPTIONS] [COMMAND [ARGS...]]
 
 Options:
-  --map PATH       Mount PATH as read-only inside the sandbox
-  --rw-map PATH    Mount PATH as read-write inside the sandbox
-  --lockdown       Paranoid mode: project read-only, no network, no GPU,
-                   no display, no dotfiles, clean environment
-  --dry-run        Show what the sandbox would do without executing
-  --verbose, -v    Show detailed mount and configuration info
-  --self-test      Run the validation suite and exit
-  --version        Show version and exit
-  --help           Show this help message
+  --map PATH         Mount PATH as read-only inside the sandbox
+  --rw-map PATH      Mount PATH as read-write inside the sandbox
+  --lockdown         Paranoid mode: project read-only, no network, no GPU,
+                     no display, no dotfiles, clean environment
+  --allow-keychain   (macOS) Mount ~/Library/Keychains inside the sandbox.
+                     Default is off: agent recipes sync specific keychain
+                     items into allowlisted files (see config/agents.conf).
+  --dry-run          Show what the sandbox would do without executing
+  --verbose, -v      Show detailed mount and configuration info
+  --self-test        Run the validation suite and exit
+  --version          Show version and exit
+  --help             Show this help message
 
 Examples:
   magen bash
   magen cursor
+  magen agent
   magen --lockdown bash
   magen --dry-run --verbose bash
   magen --map /opt/extra-tools bash
@@ -119,6 +124,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --lockdown)
             LOCKDOWN=true
+            shift
+            ;;
+        --allow-keychain)
+            ALLOW_KEYCHAIN=true
             shift
             ;;
         --dry-run)
@@ -218,6 +227,10 @@ fi
 
 # shellcheck source=lib/config.sh
 source "$SCRIPT_REAL_DIR/lib/config.sh"
+
+# shellcheck source=lib/agents.sh
+source "$SCRIPT_REAL_DIR/lib/agents.sh"
+agents_resolve "${COMMAND_ARGS[0]}"
 
 # shellcheck source=lib/proxies.sh
 source "$SCRIPT_REAL_DIR/lib/proxies.sh"

@@ -158,6 +158,15 @@ BASHRC
             log "env: color enabled (TTY detected)"
         fi
 
+        # Agent recipe SET_ENV (e.g. AGENT_CLI_CREDENTIAL_STORE=file).
+        local _se _sk _sv
+        for _se in ${_AGENTS_SET_ENV[@]+"${_AGENTS_SET_ENV[@]}"}; do
+            [[ "$_se" == *=* ]] || continue
+            _sk="${_se%%=*}"
+            _sv="${_se#*=}"
+            bw --setenv "$_sk" "$_sv"
+        done
+
         # Landlock tightens FS access after mounts (defense in depth inside bwrap).
         LANDLOCK_INSIDE=""
         if [ -f "${SCRIPT_REAL_DIR}/lib/landlock.py" ] && command -v python3 &>/dev/null; then

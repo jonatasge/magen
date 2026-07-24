@@ -26,6 +26,10 @@ CONFIG_DENY=(BraveSoftware Bitwarden google-chrome chromium gh gcloud helm)
 CACHE_DENY=(BraveSoftware chromium google-chrome)
 
 # macOS ~/Library paths that may be written (Seatbelt allowlist).
+# Keychains is NOT included by default — full keychain access would expose every
+# secret to the sandbox. Agent recipes (config/agents.conf) may materialize
+# specific keychain items into allowlisted files (e.g. ~/.cursor/auth.json).
+# Use --allow-keychain only when an app truly needs Security.framework inside.
 # shellcheck disable=SC2034
 LIBRARY_ALLOW=(Caches Preferences Logs Fonts Developer LaunchAgents)
 # shellcheck disable=SC2034
@@ -34,12 +38,14 @@ LIBRARY_APP_SUPPORT_ALLOW=(Cursor Code)
 # --- Environment sanitization ---
 # Variables matching these prefixes are stripped before entering the sandbox.
 _ENV_SENSITIVE_PREFIXES=(
-    AWS_ AZURE_ GCP_ GOOGLE_CLOUD_ GOOGLE_APPLICATION_
+    AWS_ AZURE_ GCP_ GOOGLE_CLOUD_ GOOGLE_APPLICATION_ GOOGLE_GENAI_ GOOGLE_API_
     GITHUB_ GH_ GITLAB_ BITBUCKET_
     NPM_TOKEN NPM_AUTH
     DOCKER_
     DATABASE_ DB_PASSWORD DB_USER
-    OPENAI_ ANTHROPIC_
+    OPENAI_ ANTHROPIC_ CURSOR_ CLAUDE_ GEMINI_ CODEX_
+    XAI_ KIMI_ OPENCODE_ OPENCLAW_ HERMES_ CONTINUE_
+    DEEPSEEK_ GROQ_ OPENROUTER_ COPILOT_ AIDER_
     SENTRY_ CODECOV_ SONAR_ SNYK_
     VAULT_ CONSUL_
     HEROKU_ NETLIFY_ VERCEL_

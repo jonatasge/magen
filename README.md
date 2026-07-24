@@ -173,25 +173,26 @@ magen --self-test
 # Run with verbose output
 magen --self-test --verbose
 
-# Run only normal mode tests
+# Categories (run in parallel workers): sandbox, agents, isolation, proxies, lockdown
 magen --self-test --normal-only
-
-# Run only lockdown mode tests
 magen --self-test --lockdown-only
+magen --self-test --category sandbox,agents
+magen --self-test --category proxies
 ```
 
 ### CLI reference
 
-| Flag              | Description                                                                  |
-| ----------------- | ---------------------------------------------------------------------------- |
-| `--lockdown`      | Paranoid mode: project read-only, no network, no GPU, no dotfiles, clean env |
-| `--map PATH`      | Mount PATH as read-only inside the sandbox                                   |
-| `--rw-map PATH`   | Mount PATH as read-write inside the sandbox                                  |
-| `--dry-run`       | Show what the sandbox would do without executing                             |
-| `--verbose`, `-v` | Show detailed mount and configuration info                                   |
-| `--self-test`     | Run the validation suite and exit                                            |
-| `--version`       | Show version and exit                                                        |
-| `--help`, `-h`    | Show help message                                                            |
+| Flag                | Description                                                                                          |
+| ------------------- | ---------------------------------------------------------------------------------------------------- |
+| `--lockdown`        | Paranoid mode: project read-only, no network, no GPU, no dotfiles, clean env                         |
+| `--allow-keychain`  | (macOS) Mount `~/Library/Keychains`. Default off; recipes sync keychain→file (see `config/agents.conf`) |
+| `--map PATH`        | Mount PATH as read-only inside the sandbox                                                           |
+| `--rw-map PATH`     | Mount PATH as read-write inside the sandbox                                                          |
+| `--dry-run`         | Show what the sandbox would do without executing                                                     |
+| `--verbose`, `-v`   | Show detailed mount and configuration info                                                           |
+| `--self-test`       | Run the validation suite and exit                                                                    |
+| `--version`         | Show version and exit                                                                                |
+| `--help`, `-h`      | Show help message                                                                                    |
 
 ---
 
@@ -600,7 +601,19 @@ Mounted as read-only. These are toolchains and SDKs that should be available but
 
 Directories not in either list are never mounted, including (but not limited to):
 
-`.gnupg`, `.aws`, `.ssh` (except `config` and `known_hosts`), `.mozilla`, `.sparrow`, `.kube`, `.password-store`, `.vault-token`, `.terraform.d`, `.pki`, `.gemini`, `.claude`
+`.gnupg`, `.aws`, `.ssh` (except `config` and `known_hosts`), `.mozilla`, `.sparrow`, `.kube`, `.password-store`, `.vault-token`, `.terraform.d`, `.pki`
+
+Agent homes such as `.claude`, `.gemini`, `.codex` are mounted only when the matching recipe is active (see below).
+
+### Agent / provider recipes (`config/agents.conf`)
+
+Extensible without code changes. Overlay: `~/.config/magen/agents.conf`.
+
+Per-command recipes add home dotdirs, env pass-through, macOS Application Support dirs, `SET_ENV`, and optional keychain→JSON exports. Interactive shells (`magen`, `magen bash`) activate **all** recipes; `magen sh -c …` / scripts do not (isolation tests keep `.claude` hidden).
+
+Built-in recipes (docs-verified only): Cursor (`agent`), Claude Code (`claude`), Codex (`codex`), Gemini CLI (`gemini`), GitHub Copilot CLI (`copilot`), xAI Grok Build (`grok`), Kimi Code CLI (`kimi`), OpenCode (`opencode`), OpenClaw (`openclaw`), Hermes Agent (`hermes`), Aider (`aider`), Continue CLI (`cn`).
+
+API keys listed in `GLOBAL_PASS_ENV` / `PASS_ENV` survive env sanitization; other secrets matching sensitive prefixes are still stripped. Add unverified tools via `~/.config/magen/agents.conf`.
 
 ### Config deny list
 
@@ -619,7 +632,9 @@ Subdirectories of `~/.cache/` that are masked:
 Only these subdirectories of `~/Library/` are writable:
 
 - **Library:** `Caches`, `Preferences`, `Logs`, `Fonts`, `Developer`, `LaunchAgents`
-- **Application Support:** `Cursor`, `Code`
+- **Application Support:** `Cursor`, `Code` (plus any `APP_SUPPORT` from active agent recipes)
+
+`~/Library/Keychains` is **not** mounted by default (high risk: would expose every keychain secret). On macOS, recipes may export specific keychain items into allowlisted files (Cursor → `~/.cursor/auth.json` + `AGENT_CLI_CREDENTIAL_STORE=file`). Use `--allow-keychain` only when an app truly needs Security.framework inside the sandbox.
 
 ### RC files (read-only)
 
@@ -764,8 +779,11 @@ The parent directory of the project is mounted read-write **unless** it is sensi
 ├── install.sh               # Installer (symlinks to ~/.local/bin)
 ├── uninstall.sh             # Removes symlinks and PATH blocks
 ├── VERSION                  # Semver version file
+├── config/
+│   └── agents.conf          # AI agent / provider recipes (env, homes, keychain)
 ├── lib/                     # Sourced helpers (not run directly)
 │   ├── config.sh            # Access control lists and shared helpers
+│   ├── agents.sh            # Loads agents.conf; extends allowlists / auth
 │   ├── proxies.sh           # Proxy lifecycle (Docker, npm, Azure CLI)
 │   ├── chromium.sh          # Chromium/Electron binary resolution
 │   ├── linux.sh             # Linux backend (bubblewrap)
@@ -799,6 +817,8 @@ The parent directory of the project is mounted read-write **unless** it is sensi
 | File                      | Type   | Description                                                                                                                                                                                                                                                                                                |
 | ------------------------- | ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `lib/config.sh`           | bash   | Central configuration: dotdir allowlists (RW/RO), deny lists (config/cache), macOS Library allowlists, sensitive env prefixes, sensitive file patterns (dual glob+regex format), safe env exceptions, helper functions (`is_rw`, `is_allowed_ro`, `_is_env_safe`, `_sanitize_docker_config`).              |
+| `lib/agents.sh`           | bash   | Config-driven agent recipes: loads `config/agents.conf` (+ user overlay), extends dotdirs/`PASS_ENV`/`SET_ENV`/App Support, materializes keychain→JSON on macOS.                                                                                                                                              |
+| `config/agents.conf`      | text   | Docs-verified recipes for AI CLIs (Cursor, Claude, Codex, Gemini, Copilot, Grok, Kimi, OpenCode, OpenClaw, Hermes, Aider, Continue).                                                                                                                                                                         |
 | `lib/proxies.sh`          | bash   | Sidecar proxy lifecycle: start/stop for Docker proxy, npm registry proxy, Azure CLI proxy. SSH agent management. Shared helpers `_wait_sidecar_ready()` and `_cleanup_sidecar()`.                                                                                                                          |
 | `lib/chromium.sh`         | bash   | Chromium/Electron binary resolution: `resolve_snap_binary()`, `find_chromium_binary()`, `is_chromium_based()` (detects via `*_crashpad_handler`), `resolve_macos_electron()`, `create_chromium_wrappers()` (creates `--no-sandbox` shims for all detected Chromium binaries).                              |
 | `lib/linux.sh`            | bash   | Linux backend: bubblewrap mounts, Landlock, cgroups, X11, session integration. Defines `magen_linux()`.                                                                                                                                                                                                     |
@@ -810,7 +830,7 @@ The parent directory of the project is mounted read-write **unless** it is sensi
 | `proxies/azure_cli.py`    | python | Azure CLI command proxy. Allowlist-only security model for DevOps commands. Handles file transfer (`--in-file`) by materializing files on the host side. JSON-over-Unix-socket protocol.                                                                                                                   |
 | `wrappers/az.py`          | python | Thin `az` CLI shim installed inside the sandbox. Forwards commands to `proxies/azure_cli.py` via Unix socket. Reads `--in-file` content and sends it alongside the command. Shows help listing allowed commands.                                                                                           |
 | `mcp/chrome.sh`           | bash   | Wrapper for `chrome-devtools-mcp` inside bwrap. Starts headless Chrome with `--no-sandbox`, manages port allocation, PID locks, orphan cleanup. Falls through on macOS.                                                                                                                                     |
-| `tests/test.sh`           | bash   | Integration test suite. Runs commands inside real sandboxes and asserts isolation. Supports `--normal-only`, `--lockdown-only`, `--verbose`. Parallelizes proxy tests for speed. Invoked via `magen --self-test`.                                                                                        |
+| `tests/test.sh`           | bash   | Integration suite by category (`sandbox`, `agents`, `isolation`, `proxies`, `lockdown`). Workers run in parallel with isolated TEMP dirs. Flags: `--normal-only`, `--lockdown-only`, `--category LIST`, `--verbose`. Via `magen --self-test`.                                                              |
 | `tests/batch_linux.sh`    | bash   | Batch test script that runs inside the sandbox during Linux tests. Outputs `KEY=VALUE` pairs consumed by `tests/test.sh` assertions. Checks filesystem isolation, dotdir visibility, credential stripping, sensitive file masking, environment sanitization, Docker/Azure config sanitization, XDG masking, DNS. |
 
 ---
@@ -933,10 +953,12 @@ Network is fully open in normal mode, so HTTP/HTTPS requests work. However, clou
 
 ### How do I add a new dotdir to the allowlist?
 
-Edit `lib/config.sh`:
+For a base toolchain/tool used by every command, edit `lib/config.sh`:
 
 - Add to `_DOTDIR_RW_LIST` for read-write access
 - Add to `_DOTDIR_RO_LIST` for read-only access
+
+For an AI agent/CLI, prefer `config/agents.conf` (or `~/.config/magen/agents.conf`) with `HOME_RW` / `PASS_ENV` / `KEYCHAIN` so access is scoped to that command.
 
 ### What happens if I create files in `$HOME` inside the sandbox?
 
